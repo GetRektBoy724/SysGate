@@ -17,6 +17,8 @@ public class SysGate {
 
     public Dictionary<UInt64, SyscallTableEntry> SyscallTableEntries = new Dictionary<UInt64, SyscallTableEntry>();
 
+    public IntPtr SyscallExecuterAddress = IntPtr.Zero;
+
     public struct SyscallTableEntry {
         public string Name;
         public UInt64 Hash;
@@ -40,6 +42,7 @@ public class SysGate {
         return hash;
     }
 
+    // managed to unmanaged
     public static unsafe void Copy(byte[] source, int startIndex, IntPtr destination, int length) {
         if (source == null || source.Length == 0 || destination == IntPtr.Zero || length == 0) {
             throw new ArgumentNullException("Exception : One or more of the arguments are zero/null!");
@@ -55,29 +58,66 @@ public class SysGate {
         }
     }
 
+    // unmanaged to managed
+    public static unsafe void Copy(IntPtr source, ref byte[] destination, int startIndex, int length) {
+        if (source == IntPtr.Zero || destination == null || destination.Length == 0 || length == 0) {
+            throw new ArgumentNullException("Exception : One or more of the arguments are zero/null!");
+        }
+        if ((startIndex + length) > destination.Length) {
+            throw new ArgumentOutOfRangeException("Exception : startIndex and length exceeds the size of destination bytes!");
+        }
+        byte* TargetByte = (byte*)(source.ToPointer());
+        int sourceIndex = 0;
+        for (int targetIndex = startIndex; targetIndex < (startIndex + length); targetIndex++) {
+            destination[targetIndex] = *(TargetByte + sourceIndex);
+            sourceIndex++;
+        }
+    }
+
+    public static byte[] Combine(byte[] a1, byte[] a2, byte[] a3)
+    {
+        byte[] ret = new byte[a1.Length + a2.Length + a3.Length];
+        Array.Copy(a1, 0, ret, 0, a1.Length);
+        Array.Copy(a2, 0, ret, a1.Length, a2.Length);
+        Array.Copy(a3, 0, ret, a1.Length + a2.Length, a3.Length);
+        return ret;
+    }
+
+
     public bool Gate(UInt64 Hash) {
         if (!this.IsGateReady || GatePositionAddress == IntPtr.Zero) {
             bool result = this.PrepareGateSpace();
-            if (!result) {
-                Console.WriteLine("Failed to prepare gate space!");
+            if (!result) 
                 return false;
-            }
         }
 
         if (!this.SyscallTableEntries.ContainsKey(Hash))
             return false;
         Int16 SyscallID = this.SyscallTableEntries[Hash].SyscallID;
 
-        byte[] stub = new byte[24] { // a bit of obfuscation, i know it is an eyesore
-            Convert.ToByte("4C", 16), Convert.ToByte("8B", 16), Convert.ToByte("D1", 16),
-            Convert.ToByte("B8", 16), (byte)SyscallID, (byte)(SyscallID >> 8), Convert.ToByte("00", 16), Convert.ToByte("00", 16),
-            Convert.ToByte("F6", 16), Convert.ToByte("04", 16), Convert.ToByte("25", 16), Convert.ToByte("08", 16), Convert.ToByte("03", 16), Convert.ToByte("FE", 16), Convert.ToByte("7F", 16), Convert.ToByte("01", 16),
-            Convert.ToByte("75", 16), Convert.ToByte("03", 16),
-            Convert.ToByte("0F", 16), Convert.ToByte("05", 16),
-            Convert.ToByte("C3", 16),
-            Convert.ToByte("CD", 16), Convert.ToByte("2E", 16),
-            Convert.ToByte("C3", 16)
-        };
+        byte[] stub = new byte[0];
+        if (this.SyscallExecuterAddress != IntPtr.Zero) {
+            byte[] jumpAddr = (IntPtr.Size == 4 ? BitConverter.GetBytes((Int32)SyscallExecuterAddress) : BitConverter.GetBytes((Int64)SyscallExecuterAddress));
+            byte[] jumpStub = Combine(new byte[] { Convert.ToByte("49", 16), Convert.ToByte("BB", 16) }, jumpAddr, new byte[] { Convert.ToByte("41", 16), Convert.ToByte("FF", 16), Convert.ToByte("E3", 16) }); // move r11, <jump addr>; jmp r11;
+
+            stub = new byte[8] {
+                Convert.ToByte("4C", 16), Convert.ToByte("8B", 16), Convert.ToByte("D1", 16), // move r10, rcx
+                Convert.ToByte("B8", 16), (byte)SyscallID, (byte)(SyscallID >> 8), Convert.ToByte("00", 16), Convert.ToByte("00", 16), // mov eax, <syscall id>
+            };
+            stub = stub.Concat(jumpStub).ToArray();
+        }else {
+            // this one will acted like a fail safe if NtTestAlert is hooked
+            stub = new byte[24] {
+                Convert.ToByte("4C", 16), Convert.ToByte("8B", 16), Convert.ToByte("D1", 16),
+                Convert.ToByte("B8", 16), (byte)SyscallID, (byte)(SyscallID >> 8), Convert.ToByte("00", 16), Convert.ToByte("00", 16),
+                Convert.ToByte("F6", 16), Convert.ToByte("04", 16), Convert.ToByte("25", 16), Convert.ToByte("08", 16), Convert.ToByte("03", 16), Convert.ToByte("FE", 16), Convert.ToByte("7F", 16), Convert.ToByte("01", 16),
+                Convert.ToByte("75", 16), Convert.ToByte("03", 16),
+                Convert.ToByte("0F", 16), Convert.ToByte("05", 16),
+                Convert.ToByte("C3", 16),
+                Convert.ToByte("CD", 16), Convert.ToByte("2E", 16),
+                Convert.ToByte("C3", 16)
+            };
+        }
 
         Copy(stub, 0, this.GatePositionAddress, stub.Length);
         Array.Clear(stub, 0, stub.Length); // clean up
@@ -95,7 +135,7 @@ public class SysGate {
 
         IntPtr pMethod = method.MethodHandle.GetFunctionPointer();
 
-        this.GatePositionAddress = (IntPtr)pMethod; // this works fine
+        this.GatePositionAddress = pMethod; // this works fine
         this.IsGateReady = true;
         return true;
     }
@@ -157,6 +197,16 @@ public class SysGate {
                 this.SyscallTableEntries.Add(TempNtFunctionList[i].Hash, currententrytable);
             }
             this.IsSyscallReady = true;
+
+            IntPtr SearchStartAddress = (IntPtr)SyscallTableEntries[GetFunctionDJB2Hash("NtTestAlert")].ExportAddress; // we just need to hope that NtTestAlert is not hooked :')
+            byte[] SearchTarget = { Convert.ToByte("F6", 16), Convert.ToByte("04", 16), Convert.ToByte("25", 16), Convert.ToByte("08", 16), Convert.ToByte("03", 16), Convert.ToByte("FE", 16), Convert.ToByte("7F", 16), Convert.ToByte("01", 16), Convert.ToByte("75", 16), Convert.ToByte("03", 16), Convert.ToByte("0F", 16), Convert.ToByte("05", 16), Convert.ToByte("C3", 16), Convert.ToByte("CD", 16), Convert.ToByte("2E", 16), Convert.ToByte("C3", 16) }; // this way, we can still support x86 (legacy)
+            for (int i = 0; i < 32; i++) {
+                byte[] CurrentSearch = new byte[16];
+                Copy((SearchStartAddress + i), ref CurrentSearch, 0, 16);
+                if (CurrentSearch.SequenceEqual(SearchTarget)) {
+                    SyscallExecuterAddress = SearchStartAddress + i;
+                }
+            }
         }catch { }
     }
 
